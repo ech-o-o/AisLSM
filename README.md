@@ -22,3 +22,6 @@ Welcome to the Pome open source project! This project is based on the Linux `io_
    mkdir -p build && cd build
    cmake -DCMAKE_BUILD_TYPE=Release ..  -DWITH_SNAPPY=1 &&  cmake --build .
 
+# Reference 
+
+1. Yanpeng Hu, Li Zhu, Lei Jia, Chundong Wang. Pome: Parallelizing I/Os and Computations for Efficient LSM-tree-based Data Storage. In 35th ACM International Symposium on High-Performance Parallel and Distributed Computing (HPDC 2026)
