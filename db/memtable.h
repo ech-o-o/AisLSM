@@ -539,7 +539,10 @@ class MemTable {
   }
 
   // Lei modified: data structure for save io_uring
-  struct uring_queue* uq;
+  // FIX: default-initialize. Under disable_wal, uq is never assigned (the
+  // assignment lives in the creating_new_log branch), and flush reads `if(uq)`
+  // on this raw pointer -> wild-pointer deref. Match the sibling log_writer.
+  struct uring_queue* uq = nullptr;
   // Lei modified: data structure for log
   void* log_writer = nullptr;
 

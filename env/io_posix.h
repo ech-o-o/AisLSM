@@ -59,11 +59,31 @@ struct uring_queue{
   // reserve file number of input sstable
   std::unordered_set<uint64_t> store_filenumber;
   std::atomic<bool> running;
-  uint8_t sync_count = 0;
+  // Widened to uint32_t as a defensive margin (uint8_t is sufficient for the
+  // current per-queue fsync counts; this only removes any future wrap concern).
+  uint32_t sync_count = 0;
   uint8_t ref = 0;
-  uint32_t job_id;
+  // FIX: atomic -- a stealing claimer writes job_id while a consumer compares
+  // fp->uptr->job_id under urings.mtx; plain uint32_t was a data race.
+  std::atomic<uint32_t> job_id{0};
   uint16_t id;
   std::vector<int> fds;
+  // FIX(bug#2): serializes io_uring SQ access (get_sqe/prep/submit) and the
+  // fds/sync_count bookkeeping when multiple subcompaction threads share one
+  // queue (max_subcompactions>1). Uncontended in the default single-thread
+  // case; taken once per output-SST fsync submission, so no hot-path cost.
+  // Lock order: urings.mtx (outer) -> qmtx (inner). Never take mtx after qmtx.
+  std::mutex qmtx;
+  // FIX(bug#7): true once the claiming job has finished ALL its submissions
+  // (set after subcompaction threads join). get_empty_element may only steal
+  // (drain-and-reclaim) a queue whose producer is done; stealing a queue whose
+  // owner is still submitting reaped its CQEs and closed its fds mid-flight.
+  std::atomic<bool> producer_done{true};
+  // FIX(bug#5): set true when a submitted async fsync completes with res<0
+  // (or its wait fails), so the failure is not silently treated as durable.
+  // A failed queue is quarantined: never claimed again, its store_filenumber
+  // is never promoted, so grandparent SSTs are retained (durability net).
+  std::atomic<bool> sync_failed{false};
 };
 enum uring_type;
 class Urings{
@@ -103,7 +123,10 @@ class Urings{
 
     std::mutex mtx;
 
-    uint32_t allowed_seeks=0;
+    // FIX: was a plain uint32_t incremented lock-free by concurrent
+    // Version::Get() readers and read/reset under DB mutex_ in NeedsCompaction
+    // -> data race / UB. Pure heuristic counter, relaxed ordering suffices.
+    std::atomic<uint32_t> allowed_seeks{0};
     double score_adjustment = 1.0;
     struct uring_queue** log_urings = nullptr;
     

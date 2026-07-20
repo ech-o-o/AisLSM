@@ -45,17 +45,22 @@ bool LevelCompactionPicker::NeedsCompaction(
   const double lower_bound = 1.0 /8;
   const double upper_bound = 8.0;
 
+  // FIX: snapshot-and-reset the racy counter once with an atomic exchange so
+  // both branches see one consistent value (was two separate lock-free reads
+  // plus a non-atomic reset below).
+  uint32_t seeks = urings.allowed_seeks.exchange(0, std::memory_order_relaxed);
+
   // not too many read requests, lower the frequency
-  if ( (urings.allowed_seeks<8) && (urings.score_adjustment < upper_bound) ) {
+  if ( (seeks<8) && (urings.score_adjustment < upper_bound) ) {
     urings.score_adjustment *=2.0;  
   }
   
   // too many seek misses, do more compactions
-  if ( (urings.allowed_seeks>8) && (urings.score_adjustment > lower_bound) )  {
-    urings.score_adjustment /=2.0; 
+  if ( (seeks>8) && (urings.score_adjustment > lower_bound) )  {
+    urings.score_adjustment /=2.0;
   }
 
-  urings.allowed_seeks=0;
+  // allowed_seeks already reset atomically by the exchange() above
   
 
   for (int i = 0; i <= vstorage->MaxInputLevel(); i++) {

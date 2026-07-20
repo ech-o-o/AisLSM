@@ -2130,8 +2130,31 @@ Status DBImpl::SwitchMemtable(ColumnFamilyData* cfd, WriteContext* context) {
       io_s = cur_log_writer->WriteBuffer();
 
       struct uring_queue* uptr = urings.get_empty_element_for_log();
-      cur_log_writer->file()->ASync(false, uptr);
-      cfd->mem()->uq = uptr;
+      // FIX(bug#6): WritableFileWriter::ASync silently submits NOTHING when
+      // pending_sync_ is false (e.g. the WAL was already synced by
+      // WriteOptions.sync=true or SyncWAL()), and its status used to be
+      // discarded. Recording uq anyway made the flush thread block forever on
+      // a completion that never arrives, wedging the ring. Only record uq if
+      // a completion was truly enqueued (sync_count advanced); otherwise
+      // release the ring. Same-thread read of sync_count is safe: this thread
+      // just claimed the ring exclusively.
+      uint32_t sync_before = uptr->sync_count;
+      IOStatus async_s = cur_log_writer->file()->ASync(false, uptr);
+      if (async_s.ok() && uptr->sync_count > sync_before) {
+        cfd->mem()->uq = uptr;
+      } else {
+        cfd->mem()->uq = nullptr;
+        uptr->producer_done.store(true, std::memory_order_release);
+        uptr->running.store(false, std::memory_order_release);
+        if (!async_s.ok()) {
+          ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                         "Pome: WAL ASync failed at memtable switch: %s",
+                         async_s.ToString().c_str());
+          if (io_s.ok()) {
+            io_s = async_s;
+          }
+        }
+      }
       cfd->mem()->SetLogWriter(static_cast<void*>(cur_log_writer));
 
       if (s.ok()) {

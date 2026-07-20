@@ -651,6 +651,11 @@ Status CompactionJob::Run() {
     thread.join();
   }
 
+  // FIX(bug#7): every subcompaction has joined, so no further async fsyncs
+  // will be submitted on this job's queue. Only now may get_empty_element's
+  // reclaim fallback drain-and-reuse it (see producer_done in io_posix.h).
+  uptr->producer_done.store(true, std::memory_order_release);
+
   compaction_stats_.SetMicros(db_options_.clock->NowMicros() - start_micros);
 
   for (auto& state : compact_->sub_compact_states) {
@@ -721,25 +726,20 @@ Status CompactionJob::Run() {
             uptr->store_filenumber.insert(fp->fd.GetNumber());
 
           if(fp->uptr != nullptr && fp->uptr->job_id == fp->job_id){
+            // wait_for_queue drains this ancestor queue's deferred fsyncs and,
+            // ON SUCCESS, promotes its recorded input files for deletion
+            // (FIX(bug#11): promotion is centralized in wait_for_queue so the
+            // get_empty_element steal path reclaims too, not only this site
+            // whose job_id guard rarely matched). ON A FAILED fsync it
+            // quarantines the queue and does NOT promote, so grandparents are
+            // retained as the durability backup.
             urings.wait_for_queue(fp->uptr);
-          for (auto it = fp->uptr->store_filenumber.begin(); it != fp->uptr->store_filenumber.end();) {
-              // if it is in no_ref, move it to urings.deleted
-              auto it_in_no_ref = urings.no_ref.find(*it); 
-              if (it_in_no_ref != urings.no_ref.end())
-              {
-                urings.ToBeDeteleted.insert(std::make_pair(it_in_no_ref->first,std::move(it_in_no_ref->second)));
-                urings.no_ref.erase(it_in_no_ref);
-              }
-
-              // remove corresponding element from reserve_input
-              auto reverve_input_it = urings.reserve_input.find(*it);
-              if(reverve_input_it != urings.reserve_input.end())
-                urings.reserve_input.erase(reverve_input_it);
-
-              // remove every element form uring::store_filenumber
-              it = fp->uptr->store_filenumber.erase(it);
-            } 
-              
+            if (fp->uptr->sync_failed) {
+              ROCKS_LOG_ERROR(db_options_.info_log,
+                  "Pome: compaction input file %" PRIu64 " has a failed async "
+                  "fsync; grandparents retained (not reclaimed).",
+                  fp->fd.GetNumber());
+            }
           }
           fp->uptr = nullptr;
         }

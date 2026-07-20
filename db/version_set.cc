@@ -2319,7 +2319,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
       case GetContext::kNotFound:
         // Keep searching in other files
         // seek file miss happens. This could mean we might increase the priority of bg compaction
-        urings.allowed_seeks++;
+        urings.allowed_seeks.fetch_add(1, std::memory_order_relaxed);
         break;
       case GetContext::kMerge:
         // TODO: update per-level perfcontext user_key_return_count for kMerge

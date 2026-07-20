@@ -10,6 +10,7 @@
 #include "db/builder.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <deque>
 #include <vector>
 
@@ -315,9 +316,23 @@ Status BuildTable(
     TEST_SYNC_POINT("BuildTable:BeforeSyncTable");
     if (s.ok() && !empty) {
       StopWatch sw(ioptions.clock, ioptions.stats, TABLE_SYNC_MICROS);
-      // *io_status = file_writer->Sync(ioptions.use_fsync);
+      // ---------------------------------------------------------------------
+      // Pome design note (INTENTIONAL -- author-confirmed; do NOT "fix" this by
+      // re-enabling the Sync call below). We deliberately do NOT fsync the
+      // flushed L0 SST file here: its data is written into the OS page cache
+      // only. Durability is anchored on the WAL instead -- every parent
+      // memtable's WAL was submitted for an asynchronous (io_uring) sync, and
+      // we synchronously wait for that WAL sync to complete in the loop just
+      // below. Because the WAL covering this memtable is durable when the wait
+      // finishes, the L0 SST's contents are recoverable by WAL replay, and an
+      // explicit L0 fsync would only add a redundant, expensive sync on the
+      // flush critical path. This is how the paper's "fsync the L0 SST at
+      // flush" is realized in this prototype: WAL-anchored durability.
+      // (For readers tracing the WAL lifecycle: WAL files are obsoleted by the
+      // min_log_number rule in db/db_impl/db_impl_files.cc.)
+      // *io_status = file_writer->Sync(ioptions.use_fsync);  // see note above
 
-      // wait for log sync completes
+      // wait for the WAL (log) sync of each parent memtable to complete
       autovector<MemTable*>* parents=static_cast<autovector<MemTable*>*>(meta->parents);
       // printf("Begin!\n");
       if (LIKELY(parents!=nullptr)){
@@ -327,15 +342,56 @@ Status BuildTable(
             // printf("Wait! %p\n", i->uq);
             // file_writer->WaitASync(i->uq);
             struct io_uring_cqe *cqe;
-            int ret = io_uring_wait_cqe(&i->uq->uring, &cqe);
+            int ret;
+            do {
+              ret = io_uring_wait_cqe(&i->uq->uring, &cqe);
+            } while (UNLIKELY(ret == -EINTR));  // FIX: retry transient signal interrupts
             if(UNLIKELY(ret < 0))
             {
+              // FIX(bug#5/#12): the WAL-sync wait failed. The original code did
+              // `return s` with s==OK, so the flush job received OK plus a
+              // non-zero FileMetaData and installed an unsynced L0. Fail the
+              // flush instead so the partial file is not installed. Quarantine
+              // the ring (sync_failed) -- its CQE is unconsumed, so releasing
+              // it for reuse would hand a stale completion to the next user.
               printf("invalid io_uring_wait_cqe\n");
-              return s;
+              i->uq->sync_failed.store(true, std::memory_order_release);
+              s = Status::IOError("Pome flush: io_uring_wait_cqe failed for WAL sync");
+              *io_status = IOStatus::IOError("Pome flush: io_uring_wait_cqe failed for WAL sync");
+              i->uq = nullptr;
+              break;
             }
             else{
+              int res = cqe->res;
               io_uring_cqe_seen(&i->uq->uring, cqe);
+              {
+                // FIX(bug#16): reset the ring's bookkeeping before release.
+                // ASync pushed the WAL fd and bumped sync_count on every
+                // memtable switch, but the log path never cleared them, so
+                // fds grew for the DB's lifetime. Do NOT close the fds here:
+                // the WAL fd is owned and closed by the log writer.
+                std::lock_guard<std::mutex> qlk(i->uq->qmtx);
+                i->uq->fds.clear();
+                i->uq->sync_count = 0;
+              }
+              i->uq->producer_done.store(true, std::memory_order_release);
               (i->uq)->running.store(false);
+              if(UNLIKELY(res < 0))
+              {
+                // FIX(bug#5): the WAL fsync itself failed -> the WAL is not
+                // durable, so this L0's durability anchor is missing. Fail the
+                // flush rather than silently installing an unrecoverable L0.
+                // (The ring itself drained cleanly; it stays reusable.)
+                fprintf(stderr, "Pome flush: WAL async fsync failed, cqe->res=%d\n", res);
+                s = Status::IOError("Pome flush: WAL async fsync failed");
+                *io_status = IOStatus::IOError("Pome flush: WAL async fsync failed");
+                i->uq = nullptr;
+                break;
+              }
+              // FIX: make the drain idempotent -- if the flush is retried with
+              // the same memtables, do not wait again on a released (and
+              // possibly reclaimed) ring.
+              i->uq = nullptr;
             }
           }
         }

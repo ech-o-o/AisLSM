@@ -1644,8 +1644,12 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
 
   if(LIBURING_USE && !urings.init)
   {
-    /* Init all queues */
-    urings.init_queues(512, 4, 128,1);
+    /* Init all queues.
+     * FIX(with bug#3): 4 -> 16 log rings. The fixed allocator now WAITS for a
+     * free ring instead of corrupting a busy one, so give enough rings that
+     * memtable switches rarely have to wait (each ring is depth-1, memory cost
+     * is negligible). */
+    urings.init_queues(512, 16, 128,1);
     urings.setUpArray(5);
   }
   Status s = DB::Open(db_options, dbname, column_families, &handles, dbptr);

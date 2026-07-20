@@ -31,6 +31,7 @@
 #ifdef OS_LINUX
 #include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <sched.h>
 #endif
 #include "monitoring/iostats_context_imp.h"
 #include "port/port.h"
@@ -61,8 +62,12 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
   this->log_queue_size = log_num;
   this->compaction_queue_depth = compaction_depth;
   this->log_queue_depth = log_depth;
-  this->compaction_urings = new struct uring_queue* [compaction_num];
-  this->log_urings = new struct uring_queue* [log_num]; 
+  // FIX(bug#9): value-initialize both arrays (trailing "()") so unfilled slots
+  // are nullptr, not garbage -- clear_all() dereferenced indeterminate
+  // pointers when io_uring_queue_init failed partway (e.g. kernel without
+  // io_uring), crashing at DB open.
+  this->compaction_urings = new struct uring_queue* [compaction_num]();
+  this->log_urings = new struct uring_queue* [log_num]();
   for(uint16_t i = 0; i < compaction_num; ++i)
     {
       struct uring_queue* qptr;
@@ -72,6 +77,7 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
       qptr->sync_count = 0;
       if(io_uring_queue_init(this->compaction_queue_depth, &(qptr->uring), 0) != 0)
       {
+        delete qptr;  // FIX(bug#9): was leaked on the failure path
         init_lib = false;
         break;
       }
@@ -82,6 +88,7 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
     if(!init_lib)
     {
       clear_all(uring_type::uring_compaction_type);
+      clear_all(uring_type::uring_log_type);  // FIX(bug#9): free the log array too
       return false;
     }
     for(uint8_t i = 0; i < log_num; ++i)
@@ -93,6 +100,7 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
       qptr->id = i;
       if(io_uring_queue_init(this->log_queue_depth, &(qptr->uring), 0) != 0)
       {
+        delete qptr;  // FIX(bug#9): was leaked on the failure path
         init_lib = false;
         break;
       }
@@ -101,6 +109,7 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
     if(!init_lib)
     {
       clear_all(uring_type::uring_log_type);
+      clear_all(uring_type::uring_compaction_type);  // FIX(bug#9): free both
       return false;
     }
     this->init = true;
@@ -108,46 +117,97 @@ bool Urings::init_queues(uint16_t compaction_num, uint8_t log_num, uint16_t comp
 }
 struct uring_queue* Urings::get_empty_element(uint32_t id)
 {
-  uint32_t index = 0;
+  // FIX (bug #1, data race): the original code did a NON-atomic check-then-set
+  //   while(uptr->running) { ... }  uptr->running.store(true);
+  // The load (in the while) and the store(true) are separate atomic ops with no
+  // compare_exchange between them, so two concurrent compaction threads (Run()
+  // holds no DB mutex_) could both observe the same slot free and both claim it,
+  // ending up sharing one io_uring / fds vector / sync_count -> heap corruption,
+  // lost fsyncs, double-close. (It also always started at slot 0, concentrating
+  // contention there.)
+  // Fix: claim a slot with a single lock-free compare_exchange that atomically
+  // transitions free(false) -> running(true); only one thread can win. Start
+  // probing at id%size to spread load across slots. No mutex on this hot path.
+  const uint32_t size = this->compaction_queue_size;
   uint32_t counter_for_while = 0;
-  struct uring_queue* uptr = this->compaction_urings[index];
-  while(uptr->running)
+  while(true)
   {
-    if (counter_for_while>64)
+    uint32_t index = (id + counter_for_while) % size;
+    struct uring_queue* uptr = this->compaction_urings[index];
+    // FIX(bug#5): quarantine -- never reuse a queue whose async fsync failed;
+    // its inputs must stay unreclaimed so durability is preserved.
+    if(!uptr->sync_failed.load(std::memory_order_acquire))
     {
-      this->wait_for_queue(uptr);
-      break;
+      bool expected = false;
+      if(uptr->running.compare_exchange_strong(expected, true,
+             std::memory_order_acq_rel, std::memory_order_relaxed))
+      {
+        uptr->producer_done.store(false, std::memory_order_release);
+        uptr->job_id.store(id, std::memory_order_release);
+        return uptr;
+      }
+      if(counter_for_while > 64 &&
+         uptr->producer_done.load(std::memory_order_acquire))
+      {
+        // FIX(bug#7): all probed slots busy. Reclaim ("steal") this one ONLY if
+        // its producer has finished submitting (producer_done), and do the
+        // drain under urings.mtx so it cannot race with the legitimate
+        // consumer's wait_for_queue in CompactionJob::Run (which also holds
+        // urings.mtx). The old code drained an actively-producing queue with no
+        // lock, reaping its CQEs and closing its fds mid-flight.
+        std::lock_guard<std::mutex> lk(this->mtx);
+        this->wait_for_queue(uptr);
+        expected = false;
+        if(uptr->running.compare_exchange_strong(expected, true,
+               std::memory_order_acq_rel, std::memory_order_relaxed))
+        {
+          uptr->producer_done.store(false, std::memory_order_release);
+          uptr->job_id.store(id, std::memory_order_release);
+          return uptr;
+        }
+      }
     }
     counter_for_while += 1;
-    index = (id+counter_for_while) %(this->compaction_queue_size);
-    uptr = this->compaction_urings[index];
+    if(counter_for_while > 64)
+    {
+      sched_yield();  // all slots busy: yield instead of burning the core
+    }
   }
-  uptr->running.store(true);
-  uptr->job_id = id;
-  return uptr;
 }
 
 
 struct uring_queue* Urings::get_empty_element_for_log()
 {
-  uint32_t index = 0;
-  uint32_t counter_for_while = 0;
-  struct uring_queue* uptr = this->log_urings[index];
-  while(uptr->running)
+  // FIX(bug#3): the old fallback reaped a CQE from a still-busy ring and
+  // reused it. That stole the exact completion a flush thread (builder.cc)
+  // was counting on -> the flush blocked forever in io_uring_wait_cqe, and
+  // two threads reaped one single-consumer completion queue with no lock.
+  // New logic: claim ONLY a genuinely free ring via compare-and-swap; if all
+  // rings are busy, yield and retry. This waits for a flush to release a ring
+  // (builder.cc stores running=false after draining), which the kernel always
+  // eventually enables, so there is no deadlock -- just backpressure, which is
+  // the correct behavior when memtables are sealed faster than flushes drain.
+  uint32_t lap = 0;
+  while(true)
   {
-    if (counter_for_while > 4)
+    for(uint16_t i = 0; i < this->log_queue_size; ++i)
     {
-      struct io_uring_cqe* cqe;
-      io_uring_wait_cqe(&uptr->uring, &cqe);
-      io_uring_cqe_seen(&uptr->uring, cqe);
-      break;
+      struct uring_queue* uptr = this->log_urings[i];
+      bool expected = false;
+      if(!uptr->sync_failed.load(std::memory_order_acquire) &&
+         uptr->running.compare_exchange_strong(expected, true,
+             std::memory_order_acq_rel, std::memory_order_relaxed))
+      {
+        uptr->producer_done.store(false, std::memory_order_release);
+        return uptr;
+      }
     }
-    counter_for_while += 1;
-    index = (counter_for_while) %(this->log_queue_size);
-    uptr = this->log_urings[index];
+    lap += 1;
+    if(lap > 4)
+    {
+      sched_yield();  // all log rings in flight: wait for a flush to release one
+    }
   }
-  uptr->running.store(true);
-  return uptr;
 }
 
 void Urings::clear_all(uring_type queue_type)
@@ -159,10 +219,12 @@ void Urings::clear_all(uring_type queue_type)
       {
         for(int i = 0; i < this->compaction_queue_size; ++i)
         {
+          if(!this->compaction_urings[i]) continue;  // FIX(bug#9): partial init
           this->compaction_urings[i]->store_filenumber.clear();
           io_uring_queue_exit(&(this->compaction_urings[i]->uring));
+          delete this->compaction_urings[i];  // FIX: per-slot object was leaked
         }
-        delete this->compaction_urings;
+        delete[] this->compaction_urings;  // FIX: was scalar delete on new[] (UB)
         this->compaction_urings = nullptr;
         this->compaction_queue_size = 0;
         this->compaction_queue_depth = 0;
@@ -171,14 +233,19 @@ void Urings::clear_all(uring_type queue_type)
       }
       break;
     case uring_type::uring_log_type:
-      for(int i = 0; i < this->log_queue_size; ++i)
+      if(this->log_urings)  // FIX: guard against null array (e.g. partial init)
       {
-        io_uring_queue_exit(&(this->log_urings[i]->uring));
+        for(int i = 0; i < this->log_queue_size; ++i)
+        {
+          if(!this->log_urings[i]) continue;  // FIX(bug#9): partial init
+          io_uring_queue_exit(&(this->log_urings[i]->uring));
+          delete this->log_urings[i];  // FIX: per-slot object was leaked
+        }
+        delete[] this->log_urings;  // FIX: was scalar delete on new[] (UB)
+        this->log_urings = nullptr;
+        this->log_queue_size = 0;
+        this->log_queue_depth = 0;
       }
-      delete this->log_urings;
-      this->log_urings = nullptr;
-      this->log_queue_size = 0;
-      this->log_queue_depth = 0;
       break;
     default:
       break;
@@ -186,38 +253,98 @@ void Urings::clear_all(uring_type queue_type)
 }
 
 
-/* Wait for count times, data will reset to nullptr, need to store it before. */
-/* May need a uring_type to determine which function should be called.  */
+/* Drain all in-flight fsync completions of this queue, close the deferred
+ * fds, promote the queue's recorded input files for deletion, and release the
+ * queue for reuse.
+ * CONTRACT: the caller MUST hold urings.mtx. Both call sites comply -- the
+ * consumer loop in CompactionJob::Run (lock_guard at its top) and the reclaim
+ * fallback in get_empty_element. Holding urings.mtx serializes concurrent
+ * drains of the same single-consumer completion queue and protects the
+ * reserve_input/no_ref/ToBeDeteleted maps mutated below (same discipline as
+ * PurgeObsoleteFiles in db_impl_files.cc). Lock order: urings.mtx -> qmtx. */
 struct uring_queue* Urings::wait_for_queue(struct uring_queue* uptr)
 {
   if(!uptr->running) return uptr;
-  if(uptr->sync_count > 0)
   {
-    struct io_uring_cqe* cqe;
-    for(uint16_t i = 0; i < uptr->sync_count; ++i)
+    std::lock_guard<std::mutex> qlk(uptr->qmtx);
+    // FIX(bug#7, TOCTOU closure): re-validate UNDER qmtx that the producer has
+    // finished. The steal path checks producer_done before locking, but the
+    // queue may have been released and re-claimed in between; qmtx's acquire
+    // pairs with the producer's release in ASync/AFsync, so this load cannot
+    // be stale in the dangerous direction. Draining a queue whose producer is
+    // still submitting is wrong for every caller, so bail out universally.
+    if(!uptr->producer_done.load(std::memory_order_acquire))
     {
-      int ret = io_uring_wait_cqe(&uptr->uring, &cqe);
-      if(ret < 0)
+      return uptr;
+    }
+    if(uptr->sync_count > 0)
+    {
+      struct io_uring_cqe* cqe;
+      for(uint32_t i = 0; i < uptr->sync_count; ++i)
       {
-        printf("invalid io_uring_wait_cqe\n");
-        return nullptr;
+        int ret = io_uring_wait_cqe(&uptr->uring, &cqe);
+        if(ret < 0)
+        {
+          // FIX(bug#5): surface, don't swallow. The queue stays running=true
+          // and sync_failed=true -> quarantined (never claimed again), so its
+          // recorded inputs below are never promoted for deletion.
+          printf("invalid io_uring_wait_cqe\n");
+          uptr->sync_failed.store(true, std::memory_order_release);
+          return nullptr;
+        }
+        // FIX(bug#5): a completed-but-FAILED async fsync (res<0, e.g. EIO)
+        // must not be treated as durable. Read res before cqe_seen recycles it.
+        int res = cqe->res;
+        io_uring_cqe_seen(&uptr->uring, cqe);
+        if(res < 0)
+        {
+          fprintf(stderr,
+                  "Pome: async fsync failed, cqe->res=%d (job_id=%u)\n",
+                  res, uptr->job_id.load(std::memory_order_relaxed));
+          uptr->sync_failed.store(true, std::memory_order_release);
+        }
       }
-      io_uring_cqe_seen(&uptr->uring, cqe);
-    }
-    uptr->sync_count = 0;
+      uptr->sync_count = 0;
 
-    while(!uptr->fds.empty())
-    {
-      int fd = uptr->fds.back();
-      int result = close(fd);
-      uptr->fds.pop_back();
+      while(!uptr->fds.empty())
+      {
+        int fd = uptr->fds.back();
+        close(fd);
+        uptr->fds.pop_back();
+      }
     }
+  }
+  if(uptr->sync_failed.load(std::memory_order_acquire))
+  {
+    // Quarantine: keep running=true and keep store_filenumber unpromoted so
+    // the parental SSTs of this queue's outputs are retained (durability net).
+    return uptr;
+  }
+  // FIX(bug#11): promote this queue's recorded input files NOW that all of its
+  // fsyncs are confirmed complete, instead of relying on a future compaction
+  // whose job_id guard rarely matches (queues are reused and job_id gets
+  // overwritten long before bottom-level outputs are consumed). The old
+  // behavior left reserve_input/no_ref growing without bound and obsolete SSTs
+  // unreclaimed until shutdown. Caller holds urings.mtx (see contract).
+  for(auto it = uptr->store_filenumber.begin();
+      it != uptr->store_filenumber.end();)
+  {
+    auto nr = no_ref.find(*it);
+    if(nr != no_ref.end())
+    {
+      ToBeDeteleted.insert(std::make_pair(nr->first, std::move(nr->second)));
+      no_ref.erase(nr);
+    }
+    auto ri = reserve_input.find(*it);
+    if(ri != reserve_input.end())
+    {
+      reserve_input.erase(ri);
+    }
+    it = uptr->store_filenumber.erase(it);
   }
   if(uptr->fds.empty())
   {
     uptr->running.store(false);
-
-
   }
 
   return uptr;
@@ -1707,31 +1834,43 @@ IOStatus PosixWritableFile::ASync(const IOOptions& /*opts*/,
                                   IODebugContext* /*dbg*/, struct uring_queue* uptr){
   
   
+  // FIX(bug#5/#8): do not deref a null queue and do not return OK on failure;
+  // callers check this IOStatus (compaction_outputs::WriterSyncClose, builder)
+  // and will abort instead of installing an unsynced file.
   if(uptr == nullptr)
   {
-    printf("No more uq_t available for fsync !\n");
+    return IOStatus::IOError("Pome ASync: no io_uring queue available for " + filename_);
   }
+  // FIX(bug#2): with max_subcompactions>1 several subcompaction threads share
+  // this queue; liburing's submission queue is single-producer and the
+  // fds/sync_count bookkeeping is not atomic. qmtx makes get_sqe+prep+submit+
+  // accounting one atomic step. Uncontended by default (one thread per job).
+  std::lock_guard<std::mutex> qlk(uptr->qmtx);
   struct io_uring *uq = &uptr->uring;
   struct io_uring_sqe* sqe = io_uring_get_sqe(uq);
-  uptr->fds.push_back(fd_);
-  uptr->sync_count += 1;
   if(sqe == nullptr)
   {
-    printf("No more sqe available for fsync !\n");
+    // FIX(bug#8): never prep on a null sqe (segfault). Report queue-full error.
+    return IOStatus::IOError("Pome ASync: io_uring submission queue full for " + filename_);
   }
 
   // Lei Todo: this place should act like fdatasync, which means having flag IORING_FSYNC_DATASYNC.
   io_uring_prep_fsync(sqe, fd_, IORING_FSYNC_DATASYNC);
   // Set data can transmit datas
   //io_uring_sqe_set_data(sqe, (void*) uq);
-  struct io_uring_cqe* cqe = nullptr;
 
   int ret = io_uring_submit(uq);
   if(ret <= 0)
   {
-    printf("Submition failed of fsync !\n");
+    // FIX(bug#5): submit failed -> nothing was enqueued; report error and do
+    // NOT account it (otherwise wait_for_queue would block on a phantom CQE).
+    return IOStatus::IOError("Pome ASync: io_uring_submit failed for " + filename_);
   }
-
+  // Account the in-flight fsync only after a successful submit, so sync_count
+  // and fds exactly match what wait_for_queue must reap/close (FIX(bug#8): was
+  // incremented before the null/submit checks).
+  uptr->fds.push_back(fd_);
+  uptr->sync_count += 1;
   //printf("ASync: fd:%d, uq: %p\n", fd_, uptr);
   return IOStatus::OK();
 }
@@ -1740,30 +1879,32 @@ IOStatus PosixWritableFile::ASync(const IOOptions& /*opts*/,
 IOStatus PosixWritableFile::AFsync(const IOOptions& /*opts*/,
                                   IODebugContext* /*dbg*/, struct uring_queue* uptr)
 {
+  // FIX(bug#5/#8): mirror ASync — no null deref, no OK-on-failure.
   if(uptr == nullptr)
   {
-    printf("No more uq_t available for fsync !\n");
+    return IOStatus::IOError("Pome AFsync: no io_uring queue available for " + filename_);
   }
+  // FIX(bug#2): see ASync — serialize shared-queue submission and accounting.
+  std::lock_guard<std::mutex> qlk(uptr->qmtx);
   struct io_uring *uq = &uptr->uring;
   struct io_uring_sqe* sqe = io_uring_get_sqe(uq);
-  uptr->fds.push_back(fd_);
-  uptr->sync_count += 1;
   if(sqe == nullptr)
   {
-    printf("No more sqe available for fsync !\n");
+    return IOStatus::IOError("Pome AFsync: io_uring submission queue full for " + filename_);
   }
 
   // Lei Todo: this place should act like fsync, which means no flag IORING_FSYNC_DATASYNC.
   io_uring_prep_fsync(sqe, fd_, IORING_FSYNC_DATASYNC);
   // Set data can transmit datas
   //io_uring_sqe_set_data(sqe, (void*) uq);
-  struct io_uring_cqe* cqe = nullptr;
 
   int ret = io_uring_submit(uq);
   if(ret <= 0)
   {
-    printf("Submition failed of fsync !\n");
+    return IOStatus::IOError("Pome AFsync: io_uring_submit failed for " + filename_);
   }
+  uptr->fds.push_back(fd_);
+  uptr->sync_count += 1;
   //printf("AFSync: fd:%d, uq: %p\n", fd_, uptr);
   return IOStatus::OK();
 }
