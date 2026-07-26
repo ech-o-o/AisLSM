@@ -24,4 +24,4 @@ Welcome to the Pome open source project! This project is based on the Linux `io_
 
 ## Reference 
 
-1. Yanpeng Hu, Li Zhu, Lei Jia, Chundong Wang. **Pome: Parallelizing I/Os and Computations for Efficient LSM-tree-based Data Storage.** To be presented at the 35th ACM International Symposium on High-Performance Parallel and Distributed Computing (HPDC 2026) as a technical paper.
+Yanpeng Hu, Li Zhu, Lei Jia, and Chundong Wang. 2026. Pome: Parallelizing I/Os and Computations for Efficient LSM-tree-based Data Storage. In Proceedings of the 35th International Symposium on High-Performance Parallel and Distributed Computing (HPDC '26). Association for Computing Machinery, New York, NY, USA, 521–534. https://doi.org/10.1145/3806645.3807603. (This paper was awarded the **Best Paper Award** at HPDC 2026.)
