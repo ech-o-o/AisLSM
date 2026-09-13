@@ -249,6 +249,16 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       PutLengthPrefixedSlice(dst, Slice(unique_id_str));
     }
 
+    // Pome:世代信息。父辈文件号编成一串定长 varint。
+    if (!f.pome_parents.empty()) {
+      std::string parents_str;
+      for (uint64_t pn : f.pome_parents) {
+        PutVarint64(&parents_str, pn);
+      }
+      PutVarint32(dst, NewFileCustomTag::kPomeParents);
+      PutLengthPrefixedSlice(dst, Slice(parents_str));
+    }
+
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                              dst);
 
@@ -410,6 +420,18 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
             }
           }
           break;
+        case kPomeParents: {
+          Slice ps = field;
+          uint64_t pn = 0;
+          f.pome_parents.clear();
+          while (!ps.empty()) {
+            if (!GetVarint64(&ps, &pn)) {
+              return "invalid pome parents";
+            }
+            f.pome_parents.push_back(pn);
+          }
+          break;
+        }
         case kUniqueId:
           if (!DecodeUniqueIdBytes(field.ToString(), &f.unique_id).ok()) {
             f.unique_id = kNullUniqueId64x2;

@@ -1767,6 +1767,19 @@ Status CompactionJob::InstallCompactionResults(
     }
   }
   //
+  // Pome:把本次 compaction 的输入文件号记成所有输出文件的父辈,随 VersionEdit
+  // 一起落进 MANIFEST。这些输入正是延迟删除协议保留在盘上的后备,重启之后要靠
+  // 这份记录把它们放回 reserve_input,否则开库末尾的垃圾回收会当垃圾删掉。
+  {
+    std::vector<uint64_t> pome_parents;
+    for (size_t i = 0; i < compaction->num_input_levels(); i++) {
+      for (size_t j = 0; j < compaction->num_input_files(i); j++) {
+        pome_parents.push_back(compaction->input(i, j)->fd.GetNumber());
+      }
+    }
+    edit->SetPomeParentsForAllNewFiles(pome_parents);
+  }
+
   return versions_->LogAndApply(compaction->column_family_data(),
                                 mutable_cf_options, edit, db_mutex_,
                                 db_directory_);

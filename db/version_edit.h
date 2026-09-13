@@ -89,6 +89,8 @@ enum NewFileCustomTag : uint32_t {
   kMinTimestamp = 10,
   kMaxTimestamp = 11,
   kUniqueId = 12,
+  // Pome:世代信息。取值都低于 kCustomTagNonSafeIgnoreMask,旧版本读到会安全跳过。
+  kPomeParents = 13,  // 本文件的父辈文件号,重启后放回 reserve_input 当后备
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -225,6 +227,9 @@ struct FileMetaData {
 
   uint32_t job_id; 
   struct uring_queue* uptr = nullptr;
+  // Pome:世代信息,随 VersionEdit 一起落进 MANIFEST(见 NewFileCustomTag)。
+  // pome_parents 是本文件的父辈文件号,重启后据此恢复 reserve_input。
+  std::vector<uint64_t> pome_parents;
  
   FileMetaData() = default;
 
@@ -425,6 +430,14 @@ class VersionEdit {
   // REQUIRES: "smallest" and "largest" are smallest and largest keys in file
   // REQUIRES: "oldest_blob_file_number" is the number of the oldest blob file
   // referred to by this file if any, kInvalidBlobFileNumber otherwise.
+  // Pome:一次 compaction 的所有输出共享同一批父辈(就是这次 compaction 的输入),
+  // 所以统一记到本次 edit 里的每个新文件上。
+  void SetPomeParentsForAllNewFiles(const std::vector<uint64_t>& parents) {
+    for (auto& nf : new_files_) {
+      nf.second.pome_parents = parents;
+    }
+  }
+
   void AddFile(int level, uint64_t file, uint32_t file_path_id,
                uint64_t file_size, const InternalKey& smallest,
                const InternalKey& largest, const SequenceNumber& smallest_seqno,

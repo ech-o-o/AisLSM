@@ -1649,7 +1649,21 @@ Status DB::Open(const Options& options, const std::string& dbname, DB** dbptr) {
      * free ring instead of corrupting a busy one, so give enough rings that
      * memtable switches rarely have to wait (each ring is depth-1, memory cost
      * is negligible). */
-    urings.init_queues(512, 16, 128,1);
+    /* FIX(fd-exhaustion): compaction 队列数原来硬编码成 512。每个队列在
+     * io_uring_queue_init 里都要占掉一个文件描述符,于是 DB 一打开就先吃掉
+     * 512+16=528 个描述符——在系统默认的 1024 上限下,一半以上的额度还没开
+     * 任何一个数据文件就没了,SST 数量长到四五百个就报 "Too many open files",
+     * 随后进错误处理路径收到 SIGABRT。2026-09-03 实测:跑到第 50 秒时进程共
+     * 781 个描述符,其中 545 个是 io_uring 环,226 个才是真正的 .sst 文件。
+     *
+     * 同时并发的 compaction 任务数上界是后台任务数,默认只有个位数,512 个环里
+     * 有五百个从头到尾没被用过。这里按后台任务数来定,留 4 倍余量再夹到
+     * [32, 512] 之间:既保证 get_empty_element 几乎不会抢不到队列,又把描述符
+     * 占用从 528 降到几十个。 */
+    const int bg_jobs = std::max(db_options.max_background_jobs, 1);
+    uint16_t compaction_rings =
+        static_cast<uint16_t>(std::min(512, std::max(32, bg_jobs * 4)));
+    urings.init_queues(compaction_rings, 16, 128, 1);
     urings.setUpArray(5);
   }
   Status s = DB::Open(db_options, dbname, column_families, &handles, dbptr);

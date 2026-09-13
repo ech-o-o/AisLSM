@@ -19,6 +19,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Pome:恢复时要把持久化在 MANIFEST 里的世代信息放回内存容器。
+extern Urings urings;
+
+
 void VersionEditHandlerBase::Iterate(log::Reader& reader,
                                      Status* log_read_status) {
   Slice record;
@@ -210,6 +214,21 @@ Status VersionEditHandler::ApplyVersionEdit(VersionEdit& edit,
   if (s.ok()) {
     assert(cfd != nullptr);
     s = ExtractInfoFromVersionEdit(*cfd, edit);
+  }
+  if (s.ok()) {
+    // Pome:把随这条 edit 落盘的父辈信息放回内存容器。没有这一步,重启之后
+    // 「哪些文件是后备」就全丢了,开库末尾的垃圾回收会按「文件号不在存活集合
+    // 里」把后备直接删掉。
+    // 多留是安全的(至多多占一点盘),少留才会丢数据,所以这里宁可宽。
+    for (const auto& elem : edit.GetNewFiles()) {
+      const FileMetaData& f = elem.second;
+      if (!f.pome_parents.empty()) {
+        std::lock_guard<std::mutex> lk(urings.mtx);
+        for (uint64_t pn : f.pome_parents) {
+          urings.reserve_input.insert(pn);
+        }
+      }
+    }
   }
   return s;
 }
